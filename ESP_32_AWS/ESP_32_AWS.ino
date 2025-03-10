@@ -1,125 +1,111 @@
-#include <Wire.h>
-#include <Adafruit_TCS34725.h>
-#include <WiFi.h>
-#include <LiquidCrystal_I2C.h>
-#include <PubSubClient.h>
-#include <math.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
 
-const char* aws_endpoint = "your-aws-endpoint.amazonaws.com";
-const char* mqtt_topic = "esp32/colorData";
-const char* ssid = "your_SSID";
-const char* password = "your_PASSWORD";
+// Firebase configuration
+FirebaseConfig firebaseConfig;
+FirebaseAuth firebaseAuth;
 
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_700MS, TCS34725_GAIN_1X);
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+#define FIREBASE_HOST "automationlab-9fccb-default-rtdb.firebaseio.com"  // Firebase Project URL
+#define FIREBASE_AUTH "vYM9NyncpNvI8D0gbXKwmHtzf07Cz97HN48ggWoe"         // Firebase database secret key
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+// Network Credentials
+const char* ssid = "TESTNET";
+const char* password = "12345678";
 
-#define THRESHOLD 15.0  
+// RFID configuration
+#define SS_PIN D2
+#define RST_PIN D1
+MFRC522 rfid(SS_PIN, RST_PIN);
 
-struct ColorLevel {
-    const char* name;
-    uint8_t r, g, b;
-    uint8_t level;
-};
-
-ColorLevel color_levels[] = {
-    {"Sea Nymph", 130, 159, 152, 1},
-    {"Metallic Seaweed", 38, 127, 140, 2},
-    {"Metallic Seaweed", 26, 127, 147, 3},
-    {"Regal Blue", 0, 71, 119, 4},
-    {"Cod Grey", 13, 12, 12, 5},
-};
-
-float calculateColorDistance(uint16_t r1, uint16_t g1, uint16_t b1, uint8_t r2, uint8_t g2, uint8_t b2) {
-    return sqrt(pow(r1 - r2, 2) + pow(g1 - g2, 2) + pow(b1 - b2, 2));
-}
-
-const char* getColorLevel(uint16_t r, uint16_t g, uint16_t b, uint8_t* level) {
-    float minDistance = THRESHOLD + 1;
-    const char* closestColor = "Unknown";
-    *level = 0;
-
-    for (auto& color : color_levels) {
-        float distance = calculateColorDistance(r, g, b, color.r, color.g, color.b);
-        if (distance < minDistance) {
-            minDistance = distance;
-            closestColor = color.name;
-            *level = color.level;
-        }
-    }
-
-    return (minDistance > THRESHOLD) ? "Unknown" : closestColor;
-}
-
-void connectToWiFi() {
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-  }
-}
-
-void connectToAWS() {
-  client.setServer(aws_endpoint, 8883);
-  while (!client.connected()) {
-    if (client.connect("ESP32_Client")) {
-      // Connected to AWS IoT
-    } else {
-      delay(5000);
-    }
-  }
-}
+WiFiClient client;
+FirebaseData firebaseData;
+String lastUID = "";  // To track the last UID sent to Firebase
 
 void setup() {
   Serial.begin(115200);
-  lcd.begin();
-  lcd.backlight();
+  delay(10);
 
-  if (tcs.begin()) {
-    lcd.setCursor(0, 0);
-    lcd.print("Sensor Ready");
-  } else {
-    while (1);
+  // Connecting to Wi-Fi
+  Serial.println();
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+
+  // Wait for the Wi-Fi connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
   }
 
-  connectToWiFi();
-  connectToAWS();
+  Serial.println("\nConnected to Wi-Fi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Configure Firebase
+  firebaseConfig.host = FIREBASE_HOST;
+  firebaseConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+
+  // Initialize Firebase
+  Firebase.begin(&firebaseConfig, &firebaseAuth);
+  Firebase.reconnectWiFi(true);
+
+  // Initialize RFID
+  SPI.begin();
+  rfid.PCD_Init();
+  Serial.println("RFID reader initialized.");
 }
 
 void loop() {
-  uint16_t r, g, b, c;
-  tcs.getRawData(&r, &g, &b, &c);
-
-  float red = r;
-  float green = g;
-  float blue = b;
-
-  uint8_t alert_level;
-  const char* color_name = getColorLevel(r, g, b, &alert_level);
-
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(color_name);
-  lcd.setCursor(0, 1);
-  if (alert_level != 0) {
-    lcd.print("Level:");
-    lcd.print(alert_level);
-  } else {
-    lcd.print("Unknown");
+  // Ensure Wi-Fi and Firebase are connected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Reconnecting to WiFi...");
+    WiFi.begin(ssid, password);
+    delay(1000);
   }
 
-  Serial.print("R: "); Serial.print(red); 
-  Serial.print(" G: "); Serial.print(green); 
-  Serial.print(" B: "); Serial.println(blue);
-  Serial.print("Color: "); Serial.println(color_name);
-  Serial.print("Alert Level: "); Serial.println(alert_level);
-
-  String jsonPayload = "{\"color\":\"" + String(color_name) + "\",\"alert_level\":" + String(alert_level) + "}";
-
-  if (client.connected()) {
-    client.publish(mqtt_topic, jsonPayload.c_str());
+  // Reconnect Firebase if disconnected
+  if (!Firebase.ready()) {
+    Serial.println("Reconnecting to Firebase...");
+    Firebase.begin(&firebaseConfig, &firebaseAuth);
   }
 
-  delay(5000);
+  // Check for a new RFID card and read it
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    // Get the card number (UID)
+    String card_num = getCardNumber();
+
+    // Check if this UID has already been sent
+    if (card_num != lastUID) {
+      Serial.print("Detected Card ID: ");
+      Serial.println(card_num);
+
+      // Send the card number to Firebase
+      if (Firebase.setString(firebaseData, "/rfidData/cardID", card_num)) {
+        Serial.println("Card ID sent to Firebase successfully.");
+        lastUID = card_num;  // Update lastUID to avoid resending
+      } else {
+        Serial.print("Error sending card ID to Firebase: ");
+        Serial.println(firebaseData.errorReason());
+      }
+    } else {
+      Serial.println("Card already scanned. Remove card and try again.");
+    }
+
+    // Halt PICC to stop reading the same card repeatedly
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+
+    delay(5000);  // Delay to avoid immediate consecutive reads
+  }
+}
+
+String getCardNumber() {
+  String UID = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    UID += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+    UID += String(rfid.uid.uidByte[i], HEX);
+  }
+  UID.toUpperCase();
+  return UID;
 }
